@@ -1,0 +1,36 @@
+# Downloaded datasets and preprocessing caches
+/data/
+
+# Training results, checkpoints, predictions, and generated figures
+/outputs/
+*.pt
+*.pth
+*.ckpt
+
+# Temporary files and notebook checkpoints
+/tmp/
+.ipynb_checkpoints/
+*.log
+
+# Python bytecode, tool caches, and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local credentials
+.env
+.env.*
+!.env.example
+kaggle.json
+
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
