@@ -51,7 +51,7 @@ python run_experiments.py
 - `outputs/histories.json`：每個 epoch 的 loss 與時間
 - `outputs/experiment_manifest.json`：固定實驗設定
 
-## 參考
+## Reference
 
 - [Informer2020 官方程式庫](https://github.com/zhouhaoyi/Informer2020)
 - [Kaggle Household Electric Power Consumption](https://www.kaggle.com/datasets/uciml/electric-power-consumption-data-set)
