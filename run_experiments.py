@@ -228,6 +228,11 @@ def run_all(quick_mode: bool = False, force_retrain: bool = False) -> pd.DataFra
         epochs=1 if quick_mode else 10,
         batch_size=8 if quick_mode else 32,
         learning_rate=1e-4,
+        use_lr_scheduler=True,
+        lr_scheduler_factor=0.5,
+        lr_scheduler_patience=2,
+        lr_scheduler_threshold=1e-4,
+        min_learning_rate=1e-6,
         weight_decay=1e-5,
         stride=4,
         seed=42,
@@ -287,4 +292,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

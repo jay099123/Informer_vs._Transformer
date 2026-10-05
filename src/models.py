@@ -27,6 +27,7 @@ class ModelConfig:
     factor: int = 5
     distil: bool = True
     generative_decoder: bool = True
+    mix: bool = True
 
 
 class PositionalEmbedding(nn.Module):
@@ -119,8 +120,9 @@ class ProbSparseAttention(nn.Module):
         batch, heads, query_length, head_dim = queries.shape
         key_length = keys.size(2)
 
-        sample_keys = min(key_length, self.factor * max(1, math.ceil(math.log(key_length + 1))))
-        top_queries = min(query_length, self.factor * max(1, math.ceil(math.log(query_length + 1))))
+        # Match Informer2020's c * ceil(log(L)); keep length-one inputs valid.
+        sample_keys = min(key_length, self.factor * max(1, math.ceil(math.log(key_length))))
+        top_queries = min(query_length, self.factor * max(1, math.ceil(math.log(query_length))))
 
         sampled_indices = torch.randint(
             key_length,
@@ -131,7 +133,9 @@ class ProbSparseAttention(nn.Module):
         sampled_scores = torch.matmul(
             queries.unsqueeze(-2), sampled_keys.transpose(-2, -1)
         ).squeeze(-2)
-        sparsity = sampled_scores.max(dim=-1).values - sampled_scores.mean(dim=-1)
+        # The official approximation divides the sampled sum by all keys,
+        # rather than by the number of sampled keys.
+        sparsity = sampled_scores.max(dim=-1).values - sampled_scores.sum(dim=-1) / key_length
         top_indices = sparsity.topk(top_queries, dim=-1, sorted=False).indices
 
         selected_queries = torch.gather(
@@ -166,12 +170,15 @@ class ProbSparseAttention(nn.Module):
 
 
 class AttentionLayer(nn.Module):
-    def __init__(self, attention: nn.Module, d_model: int, n_heads: int) -> None:
+    def __init__(
+        self, attention: nn.Module, d_model: int, n_heads: int, mix: bool = False
+    ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.mix = mix
         self.query_projection = nn.Linear(d_model, d_model)
         self.key_projection = nn.Linear(d_model, d_model)
         self.value_projection = nn.Linear(d_model, d_model)
@@ -195,6 +202,9 @@ class AttentionLayer(nn.Module):
             batch, key_length, self.n_heads, self.head_dim
         )
         output = self.attention(queries, keys, values, causal=causal)
+        if self.mix:
+            # Preserve the official decoder's transpose-before-reshape behavior.
+            output = output.transpose(2, 1).contiguous()
         return self.output_projection(output.reshape(batch, query_length, -1))
 
 
@@ -275,6 +285,7 @@ class InformerDecoderLayer(nn.Module):
             make_attention(config.attention_type, config.factor, config.dropout),
             config.d_model,
             config.n_heads,
+            mix=config.mix,
         )
         self.cross_attention = AttentionLayer(
             FullAttention(config.dropout), config.d_model, config.n_heads

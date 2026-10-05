@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 import time
 from dataclasses import asdict, dataclass
@@ -12,6 +13,10 @@ from tqdm.auto import tqdm
 
 from .data import PreparedPowerData, build_loaders
 from .models import ModelConfig, build_model, count_trainable_parameters
+
+
+# Version 3 adds validation-driven scheduling and per-epoch learning rates.
+CHECKPOINT_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -29,6 +34,11 @@ class ExperimentOptions:
     maximum_validation_samples: int | None = None
     maximum_test_samples: int | None = None
     force_retrain: bool = False
+    use_lr_scheduler: bool = True
+    lr_scheduler_factor: float = 0.5
+    lr_scheduler_patience: int = 2
+    lr_scheduler_threshold: float = 1e-4
+    min_learning_rate: float = 1e-6
 
 
 def seed_everything(seed: int) -> None:
@@ -172,6 +182,23 @@ def run_experiment(
     prepared: PreparedPowerData,
     options: ExperimentOptions,
 ) -> tuple[dict, list[dict], dict[str, np.ndarray]]:
+    if options.epochs < 1:
+        raise ValueError("epochs must be at least 1")
+    if options.use_lr_scheduler:
+        if not 0.0 < options.lr_scheduler_factor < 1.0:
+            raise ValueError("lr_scheduler_factor must be between 0 and 1")
+        if options.lr_scheduler_patience < 0:
+            raise ValueError("lr_scheduler_patience must be nonnegative")
+        if (
+            not math.isfinite(options.lr_scheduler_threshold)
+            or options.lr_scheduler_threshold < 0
+        ):
+            raise ValueError("lr_scheduler_threshold must be finite and nonnegative")
+        if (
+            not math.isfinite(options.min_learning_rate)
+            or not 0.0 <= options.min_learning_rate <= options.learning_rate
+        ):
+            raise ValueError("min_learning_rate must be between 0 and learning_rate")
     seed_everything(options.seed)
     device = _device()
     checkpoint_dir = options.output_dir / "checkpoints"
@@ -202,17 +229,19 @@ def run_experiment(
 
     loaded = False
     if checkpoint_path.exists() and not options.force_retrain:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         if (
-            checkpoint.get("config") == asdict(config)
+            checkpoint.get("checkpoint_version") == CHECKPOINT_VERSION
+            and checkpoint.get("config") == asdict(config)
             and checkpoint.get("options") == _options_signature(options)
         ):
-            model.load_state_dict(checkpoint["state_dict"])
             history = checkpoint["history"]
             total_training_seconds = checkpoint["total_training_seconds"]
             peak_gpu_memory_mb = checkpoint["peak_gpu_memory_mb"]
             loaded = True
             print(f"Loaded checkpoint: {checkpoint_path}")
+        else:
+            print(f"Ignoring incompatible checkpoint; retraining: {checkpoint_path}")
 
     if not loaded:
         optimizer = torch.optim.AdamW(
@@ -220,18 +249,43 @@ def run_experiment(
             lr=options.learning_rate,
             weight_decay=options.weight_decay,
         )
+        scheduler = (
+            torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=options.lr_scheduler_factor,
+                patience=options.lr_scheduler_patience,
+                threshold=options.lr_scheduler_threshold,
+                threshold_mode="rel",
+                min_lr=options.min_learning_rate,
+            )
+            if options.use_lr_scheduler
+            else None
+        )
         scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
 
+        best_epoch = 0
+        best_validation_mse_standardized = float("inf")
+        best_state_dict = None
         for epoch in range(1, options.epochs + 1):
             started = time.perf_counter()
+            learning_rate = optimizer.param_groups[0]["lr"]
             train_mse_standardized = _run_training_epoch(
                 model, train_loader, optimizer, scaler, device
             )
             validation_mse_standardized = _validation_loss(
                 model, validation_loader, device
             )
+            if not math.isfinite(validation_mse_standardized):
+                raise RuntimeError(
+                    f"{config.name}: non-finite validation MSE at epoch {epoch}"
+                )
+            # Plateau scheduling uses validation only, after this epoch's updates.
+            if scheduler is not None:
+                scheduler.step(validation_mse_standardized)
+            next_learning_rate = optimizer.param_groups[0]["lr"]
             epoch_seconds = time.perf_counter() - started
             total_training_seconds += epoch_seconds
             record = {
@@ -239,28 +293,51 @@ def run_experiment(
                 "train_mse_standardized": train_mse_standardized,
                 "validation_mse_standardized": validation_mse_standardized,
                 "epoch_seconds": epoch_seconds,
+                "learning_rate": learning_rate,
+                "next_learning_rate": next_learning_rate,
             }
             history.append(record)
+            if validation_mse_standardized < best_validation_mse_standardized:
+                best_epoch = epoch
+                best_validation_mse_standardized = validation_mse_standardized
+                # clone() prevents subsequent CPU training from mutating the snapshot.
+                best_state_dict = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                }
             print(
                 f"{config.name:>34} | epoch {epoch:02d}/{options.epochs} | "
                 f"train MSE={train_mse_standardized:.5f} | "
-                f"val MSE={validation_mse_standardized:.5f} | {epoch_seconds:.1f}s"
+                f"val MSE={validation_mse_standardized:.5f} | "
+                f"lr={learning_rate:.2e} | next lr={next_learning_rate:.2e} | "
+                f"{epoch_seconds:.1f}s"
             )
 
         if device.type == "cuda":
             peak_gpu_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
         torch.save(
             {
+                "checkpoint_version": CHECKPOINT_VERSION,
                 "config": asdict(config),
                 "options": _options_signature(options),
-                "state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
+                "state_dict": best_state_dict,
+                "best_epoch": best_epoch,
+                "best_validation_mse_standardized": best_validation_mse_standardized,
                 "history": history,
                 "total_training_seconds": total_training_seconds,
                 "peak_gpu_memory_mb": peak_gpu_memory_mb,
             },
             checkpoint_path,
         )
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
+    model.load_state_dict(checkpoint["state_dict"])
+    best_epoch = checkpoint["best_epoch"]
+    best_validation_mse_standardized = checkpoint["best_validation_mse_standardized"]
+    print(
+        f"Using best validation checkpoint: epoch {best_epoch}/{options.epochs} | "
+        f"val MSE={best_validation_mse_standardized:.5f}"
+    )
     test_metrics, samples = evaluate_model(model, test_loader, prepared, device)
     np.savez_compressed(prediction_dir / f"{config.name}.npz", **samples)
     result = {
@@ -273,6 +350,10 @@ def run_experiment(
         "generative_decoder": config.generative_decoder,
         "parameters": count_trainable_parameters(model),
         "epochs": options.epochs,
+        "best_epoch": best_epoch,
+        "best_validation_mse_standardized": best_validation_mse_standardized,
+        "initial_learning_rate": options.learning_rate,
+        "final_learning_rate": history[-1]["next_learning_rate"],
         "average_epoch_seconds": total_training_seconds / options.epochs,
         "total_training_seconds": total_training_seconds,
         "peak_gpu_memory_mb": peak_gpu_memory_mb,
@@ -280,4 +361,3 @@ def run_experiment(
         **test_metrics,
     }
     return result, history, samples
-

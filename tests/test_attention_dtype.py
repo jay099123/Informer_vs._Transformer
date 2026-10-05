@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -78,6 +79,65 @@ class AttentionDtypeTests(unittest.TestCase):
         for parameter in model.parameters():
             self.assertIsNotNone(parameter.grad)
             self.assertTrue(torch.isfinite(parameter.grad).all().item())
+
+
+class OfficialAlignmentTests(unittest.TestCase):
+    def test_probsparse_selects_queries_using_full_key_length(self):
+        # With two sampled keys, the official scores select queries 0 and 2.
+        # Dividing by the sample count instead selects query 1.
+        queries = torch.zeros(1, 7, 1, 2)
+        queries[0, :3, 0] = torch.tensor([[10.0, 9.0], [5.0, 0.0], [9.0, 8.0]])
+        keys = torch.zeros_like(queries)
+        keys[0, :2, 0] = torch.eye(2)
+        values = torch.arange(14.0).reshape(1, 7, 1, 2)
+        sampled_indices = torch.tensor([[0, 1]]).expand(7, 2)
+        with patch.object(torch, "randint", return_value=sampled_indices) as sample:
+            actual = models.ProbSparseAttention(factor=1, dropout=0.0)(
+                queries, keys, values
+            )
+        sample.assert_called_once_with(7, (7, 2), device=queries.device)
+        full = models.FullAttention(dropout=0.0)(queries, keys, values)
+        expected = values.mean(dim=1, keepdim=True).expand_as(values).clone()
+        expected[:, [0, 2]] = full[:, [0, 2]]
+        torch.testing.assert_close(actual, expected)
+
+    def test_mix_preserves_official_transpose_before_reshape(self):
+        attention_output = torch.arange(12.0).reshape(1, 3, 2, 2)
+
+        class FixedAttention(torch.nn.Module):
+            def forward(self, queries, keys, values, causal=False):
+                return attention_output
+
+        for mix in (False, True):
+            with self.subTest(mix=mix):
+                layer = models.AttentionLayer(FixedAttention(), 4, 2, mix=mix)
+                with torch.no_grad():
+                    layer.output_projection.weight.copy_(torch.eye(4))
+                    layer.output_projection.bias.zero_()
+                inputs = torch.zeros(1, 3, 4)
+                actual = layer(inputs, inputs, inputs)
+                if mix:
+                    expected = torch.tensor([[[0., 1., 4., 5.],
+                                              [8., 9., 2., 3.],
+                                              [6., 7., 10., 11.]]])
+                else:
+                    expected = torch.arange(12.0).reshape(1, 3, 4)
+                torch.testing.assert_close(actual, expected)
+
+    def test_mix_is_only_enabled_for_decoder_self_attention(self):
+        for mix in (False, True):
+            with self.subTest(mix=mix):
+                config = models.ModelConfig(
+                    name="mix_wiring", model_type="informer", input_length=16,
+                    label_length=4, prediction_length=4, encoder_input_size=3,
+                    time_feature_size=2, d_model=16, n_heads=2, mix=mix,
+                )
+                model = models.Informer(config)
+                for layer in model.encoder.layers:
+                    self.assertFalse(layer.self_attention.mix)
+                for layer in model.decoder_layers:
+                    self.assertEqual(layer.self_attention.mix, mix)
+                    self.assertFalse(layer.cross_attention.mix)
 
 
 if __name__ == "__main__":
